@@ -28,6 +28,10 @@ def setup_argparse():
 
 def _normalize_date(value):
     """Convert a creation date to a naive UTC datetime, or return None."""
+    # A creation date that arrives as a string, which some registry
+    # parsers return, is not a datetime and falls to the None return
+    # at the bottom. Enough of those and the caller reports no
+    # creation date even though the record carried one as text.
     if isinstance(value, datetime):
         if value.tzinfo is not None:
             return value.astimezone(timezone.utc).replace(tzinfo=None)
@@ -64,6 +68,10 @@ def get_domain_age(domain, timeout=30):
         logging.warning(f"Could not parse creation date for {domain}: {raw!r}")
         return None, "no_creation_date"
 
+    # Normalising converts aware stamps to UTC and drops the zone,
+    # but now is local wall clock time on this host. For a domain
+    # created near midnight UTC the age can be off by the host offset,
+    # and the .days floor below hides anything under a full day anyway.
     creation_date = min(normalized)
     now = datetime.now()
     if creation_date > now:
@@ -89,6 +97,9 @@ def check_wayback_machine(domain, timeout=30):
     try:
         response = requests.get(
             "https://web.archive.org/cdx/search/cdx",
+            # I ask for one row and set no sort or from parameter, so
+            # calling that row the earliest rests entirely on the CDX
+            # index returning captures in time order by default.
             params={"url": domain, "output": "json", "limit": 1, "fl": "timestamp,original"},
             timeout=timeout,
         )
