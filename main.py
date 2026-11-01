@@ -1,14 +1,19 @@
 import argparse
 import logging
+import re
 import sys
-import time
+from datetime import datetime, timezone
+
 import requests
 import whois
-from datetime import datetime
-from urllib.parse import urljoin
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+DOMAIN_RE = re.compile(
+    r'^(?=.{1,253}$)([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+[A-Za-z]{2,}$'
+)
+
 
 def setup_argparse():
     """
@@ -17,98 +22,118 @@ def setup_argparse():
     parser = argparse.ArgumentParser(description='tie-Domain-Age-Analyzer: Determines domain age and checks Wayback Machine.')
     parser.add_argument('domain', help='The domain name to analyze.')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging (DEBUG level).')
+    parser.add_argument('--timeout', type=int, default=30, help='Timeout in seconds for the WHOIS query and the Wayback request (default: 30).')
     return parser
 
-def get_domain_age(domain):
+
+def _normalize_date(value):
+    """Convert a creation date to a naive UTC datetime, or return None."""
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc).replace(tzinfo=None)
+        return value
+    return None
+
+
+def get_domain_age(domain, timeout=30):
     """
     Calculates the age of a domain in days using WHOIS information.
 
-    Args:
-        domain (str): The domain name.
-
     Returns:
-        int: The age of the domain in days, or None if an error occurs.
+        tuple: (age_in_days, error) where exactly one element is set.
+        error is one of "not_registered", "query_failed", "no_creation_date",
+        or "future_creation_date".
     """
     try:
-        domain_info = whois.whois(domain)
-        if domain_info.creation_date:
-            # Handle cases where creation_date is a list
-            creation_date = domain_info.creation_date[0] if isinstance(domain_info.creation_date, list) else domain_info.creation_date
-            if creation_date:
-                domain_age = (datetime.now() - creation_date).days
-                logging.info(f"Domain {domain} creation date: {creation_date}")
-                return domain_age
-            else:
-                logging.warning(f"Could not determine creation date for {domain}.")
-                return None
-        else:
-            logging.warning(f"No creation date found in WHOIS data for {domain}.")
-            return None
+        domain_info = whois.whois(domain, timeout=timeout)
     except whois.parser.PywhoisError as e:
         logging.error(f"WHOIS query failed for {domain}: {e}")
-        return None
+        return None, "not_registered"
     except Exception as e:
         logging.error(f"An unexpected error occurred while fetching WHOIS data for {domain}: {e}")
-        return None
+        return None, "query_failed"
 
-def check_wayback_machine(domain):
+    raw = domain_info.creation_date
+    if not raw:
+        logging.warning(f"No creation date found in WHOIS data for {domain}.")
+        return None, "no_creation_date"
+
+    dates = raw if isinstance(raw, list) else [raw]
+    normalized = [d for d in (_normalize_date(item) for item in dates) if d is not None]
+    if not normalized:
+        logging.warning(f"Could not parse creation date for {domain}: {raw!r}")
+        return None, "no_creation_date"
+
+    creation_date = min(normalized)
+    now = datetime.now()
+    if creation_date > now:
+        logging.error(f"Creation date for {domain} is in the future: {creation_date}")
+        return None, "future_creation_date"
+
+    logging.info(f"Domain {domain} creation date: {creation_date}")
+    return (now - creation_date).days, None
+
+
+def check_wayback_machine(domain, timeout=30):
     """
-    Checks if a domain is listed in the Wayback Machine and returns the oldest archived URL.
+    Returns the earliest archived URL for a domain from the Wayback CDX index.
 
-    Args:
-        domain (str): The domain name.
+    The CDX listing is ordered by capture time, so its first row is the
+    earliest capture, not the snapshot closest to now.
 
     Returns:
-        str: The oldest archived URL, or None if not found.
+        tuple: (url_or_none, failed) where failed is True only when the
+        Wayback request itself could not be completed or parsed. A domain
+        with no captures returns (None, False).
     """
     try:
-        url = f"http://archive.org/wayback/available?url={domain}"
-        response = requests.get(url)
-        response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
-        data = response.json()
-
-        if data and 'archived_snapshots' in data and data['archived_snapshots']:
-            if 'closest' in data['archived_snapshots']:
-                oldest_url = data['archived_snapshots']['closest']['url']
-                logging.info(f"Oldest Wayback Machine URL for {domain}: {oldest_url}")
-                return oldest_url
-            else:
-                 logging.warning(f"No archived snapshots found for {domain} in wayback machine")
-                 return None
-        else:
-            logging.info(f"Domain {domain} not found in the Wayback Machine.")
-            return None
+        response = requests.get(
+            "https://web.archive.org/cdx/search/cdx",
+            params={"url": domain, "output": "json", "limit": 1, "fl": "timestamp,original"},
+            timeout=timeout,
+        )
     except requests.exceptions.RequestException as e:
         logging.error(f"Error accessing Wayback Machine for {domain}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"An unexpected error occurred while checking the Wayback Machine for {domain}: {e}")
-        return None
+        return None, True
+
+    if response.status_code != 200:
+        logging.error(f"Wayback Machine request for {domain} returned HTTP {response.status_code}.")
+        return None, True
+
+    try:
+        rows = response.json()
+    except ValueError as e:
+        logging.error(f"Error decoding Wayback Machine response for {domain}: {e}")
+        return None, True
+
+    if rows and rows[0] == ["timestamp", "original"]:
+        rows = rows[1:]
+
+    if not rows:
+        logging.info(f"Domain {domain} has no captures in the Wayback Machine.")
+        return None, False
+
+    first = rows[0]
+    if not isinstance(first, list) or len(first) < 2:
+        logging.error(f"Malformed Wayback Machine response for {domain}.")
+        return None, True
+    timestamp, original = first[0], first[1]
+    earliest_url = f"https://web.archive.org/web/{timestamp}/{original}"
+    logging.info(f"Earliest Wayback Machine URL for {domain}: {earliest_url}")
+    return earliest_url, False
+
 
 def is_valid_domain(domain):
     """
-    Validates the format of the input domain name.
-    Simple check; consider more robust validation if needed.
-
-    Args:
-        domain (str): The domain name.
-
-    Returns:
-        bool: True if the domain is valid, False otherwise.
+    Validates the format of the input domain name against a strict
+    domain pattern, rejecting query characters and other URL syntax.
     """
-    if not isinstance(domain, str):
-        logging.error("Invalid input: Domain must be a string.")
+    if not isinstance(domain, str) or not domain:
+        logging.error("Invalid input: Domain must be a non-empty string.")
         return False
-
-    if not domain:
-        logging.error("Invalid input: Domain cannot be empty.")
+    if not DOMAIN_RE.match(domain):
+        logging.error(f"Invalid input: {domain!r} is not a valid domain name.")
         return False
-
-    if " " in domain:
-        logging.error("Invalid input: Domain cannot contain spaces.")
-        return False
-
-    # Add more sophisticated validation here if needed (e.g., regex)
     return True
 
 
@@ -128,17 +153,35 @@ def main():
     if not is_valid_domain(domain):
         sys.exit(1)
 
-    domain_age = get_domain_age(domain)
-    if domain_age is not None:
-        print(f"Domain {domain} is {domain_age} days old.")
-    else:
-        print(f"Could not determine the age of domain {domain}.")
+    failed = False
 
-    oldest_wayback_url = check_wayback_machine(domain)
-    if oldest_wayback_url:
-        print(f"Oldest Wayback Machine URL for {domain}: {oldest_wayback_url}")
+    domain_age, age_error = get_domain_age(domain, timeout=args.timeout)
+    if age_error == "not_registered":
+        print(f"Domain {domain} does not appear to be registered (WHOIS returned no record).")
+        failed = True
+    elif age_error == "no_creation_date":
+        print(f"WHOIS record for {domain} carries no creation date; the age of the domain could not be measured.")
+        failed = True
+    elif age_error == "future_creation_date":
+        print(f"Invalid WHOIS data for {domain}: the creation date is in the future, so no age can be reported.")
+        failed = True
+    elif age_error is not None:
+        print(f"WHOIS lookup failed for {domain}; the age of the domain could not be measured.")
+        failed = True
+    else:
+        print(f"Domain {domain} is {domain_age} days old.")
+
+    earliest_wayback_url, wayback_failed = check_wayback_machine(domain, timeout=args.timeout)
+    if wayback_failed:
+        print(f"Wayback Machine lookup failed for {domain}; no archive result was retrieved.")
+        failed = True
+    elif earliest_wayback_url:
+        print(f"Earliest Wayback Machine URL for {domain}: {earliest_wayback_url}")
     else:
         print(f"Domain {domain} not found in the Wayback Machine.")
+
+    if failed:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
